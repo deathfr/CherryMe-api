@@ -5,7 +5,7 @@ import { createHash } from 'crypto';
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 const db = createClient({
   url: 'libsql://cherryme2-angelo67.aws-eu-west-1.turso.io',
@@ -22,11 +22,11 @@ app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
     const hash = hashPassword(password);
     const result = await db.execute({
-      sql: 'SELECT id, username, display_name, role, avatar_url, bio, tokens FROM users WHERE username = ? AND password_hash = ?',
+      sql: 'SELECT id, username, display_name, role, avatar_url, banner_url, bio, tokens FROM users WHERE username = ? AND password_hash = ?',
       args: [username, hash],
     });
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Nieprawidłowa nazwa użytkownika lub hasło' });
+      return res.status(401).json({ error: 'Invalid username or password' });
     }
     res.json(result.rows[0]);
   } catch (err) {
@@ -37,7 +37,7 @@ app.post('/api/login', async (req, res) => {
 app.get('/api/users/:id', async (req, res) => {
   try {
     const result = await db.execute({
-      sql: 'SELECT id, username, display_name, role, avatar_url, bio, tokens FROM users WHERE id = ?',
+      sql: 'SELECT id, username, display_name, role, avatar_url, banner_url, bio, tokens FROM users WHERE id = ?',
       args: [req.params.id],
     });
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
@@ -55,6 +55,136 @@ app.get('/api/users', async (req, res) => {
       args: [`%${q}%`, `%${q}%`],
     });
     res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- PUBLIC PROFILE ---
+app.get('/api/profile/:username', async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql: 'SELECT id, username, display_name, role, avatar_url, banner_url, bio, tokens FROM users WHERE username = ?',
+      args: [req.params.username],
+    });
+    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const user = result.rows[0];
+    const followers = await db.execute({ sql: 'SELECT COUNT(*) as count FROM follows WHERE following_id = ?', args: [user.id] });
+    const following = await db.execute({ sql: 'SELECT COUNT(*) as count FROM follows WHERE follower_id = ?', args: [user.id] });
+    const postCount = await db.execute({ sql: 'SELECT COUNT(*) as count FROM posts WHERE user_id = ?', args: [user.id] });
+    res.json({
+      ...user,
+      followers: followers.rows[0].count,
+      following: following.rows[0].count,
+      post_count: postCount.rows[0].count,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/profile/:username/posts', async (req, res) => {
+  try {
+    const user = await db.execute({ sql: 'SELECT id FROM users WHERE username = ?', args: [req.params.username] });
+    if (user.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const result = await db.execute({
+      sql: `SELECT p.*, u.display_name, u.username, u.avatar_url, u.role,
+        (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count,
+        (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count
+       FROM posts p JOIN users u ON p.user_id = u.id
+       WHERE p.user_id = ? ORDER BY p.created_at DESC`,
+      args: [user.rows[0].id],
+    });
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/follows/check/:followerId/:followingId', async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql: 'SELECT COUNT(*) as count FROM follows WHERE follower_id = ? AND following_id = ?',
+      args: [req.params.followerId, req.params.followingId],
+    });
+    res.json({ following: result.rows[0].count > 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- UPDATE PROFILE ---
+app.put('/api/users/:id', async (req, res) => {
+  try {
+    const { username, display_name, avatar_url } = req.body;
+    if (username) {
+      const existing = await db.execute({ sql: 'SELECT id FROM users WHERE username = ? AND id != ?', args: [username, req.params.id] });
+      if (existing.rows.length > 0) return res.status(400).json({ error: 'This username is already taken' });
+    }
+    const fields = [];
+    const args = [];
+    if (username) { fields.push('username = ?'); args.push(username); }
+    if (display_name) { fields.push('display_name = ?'); args.push(display_name); }
+    if (avatar_url !== undefined) { fields.push('avatar_url = ?'); args.push(avatar_url); }
+    if (req.body.banner_url !== undefined) { fields.push('banner_url = ?'); args.push(req.body.banner_url); }
+    if (req.body.bio !== undefined) { fields.push('bio = ?'); args.push(req.body.bio); }
+    if (fields.length === 0) return res.status(400).json({ error: 'No data to update' });
+    args.push(req.params.id);
+    await db.execute({ sql: `UPDATE users SET ${fields.join(', ')} WHERE id = ?`, args });
+    const result = await db.execute({
+      sql: 'SELECT id, username, display_name, role, avatar_url, banner_url, bio, tokens FROM users WHERE id = ?',
+      args: [req.params.id],
+    });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/users/:id/password', async (req, res) => {
+  try {
+    const { current_password, new_password } = req.body;
+    const currentHash = hashPassword(current_password);
+    const check = await db.execute({ sql: 'SELECT id FROM users WHERE id = ? AND password_hash = ?', args: [req.params.id, currentHash] });
+    if (check.rows.length === 0) return res.status(401).json({ error: 'Invalid current password' });
+    const newHash = hashPassword(new_password);
+    await db.execute({ sql: 'UPDATE users SET password_hash = ? WHERE id = ?', args: [newHash, req.params.id] });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- GALLERY ---
+app.get('/api/gallery/:userId', async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql: 'SELECT * FROM gallery WHERE user_id = ? ORDER BY created_at DESC',
+      args: [req.params.userId],
+    });
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/gallery', async (req, res) => {
+  try {
+    const { user_id, image_url, filename } = req.body;
+    const result = await db.execute({
+      sql: 'INSERT INTO gallery (user_id, image_url, filename) VALUES (?, ?, ?) RETURNING *',
+      args: [user_id, image_url, filename || ''],
+    });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/gallery/:id', async (req, res) => {
+  try {
+    await db.execute({ sql: 'DELETE FROM gallery WHERE id = ?', args: [req.params.id] });
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
