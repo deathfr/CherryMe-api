@@ -206,12 +206,46 @@ app.get('/api/posts', async (req, res) => {
   }
 });
 
+app.get('/api/posts/feed/:userId', async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql: `SELECT p.*, u.display_name, u.username, u.avatar_url, u.role,
+        (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count,
+        (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count
+       FROM posts p JOIN users u ON p.user_id = u.id
+       WHERE p.user_id IN (SELECT following_id FROM follows WHERE follower_id = ?)
+       ORDER BY p.created_at DESC`,
+      args: [req.params.userId],
+    });
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/posts/my/:userId', async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql: `SELECT p.*, u.display_name, u.username, u.avatar_url, u.role,
+        (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as like_count,
+        (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comment_count
+       FROM posts p JOIN users u ON p.user_id = u.id
+       WHERE p.user_id = ?
+       ORDER BY p.created_at DESC`,
+      args: [req.params.userId],
+    });
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/posts', async (req, res) => {
   try {
-    const { user_id, content, image_url, is_premium } = req.body;
+    const { user_id, content, image_url, is_premium, coin_price } = req.body;
     const result = await db.execute({
-      sql: 'INSERT INTO posts (user_id, content, image_url, is_premium) VALUES (?, ?, ?, ?) RETURNING *',
-      args: [user_id, content, image_url || '', is_premium || 0],
+      sql: 'INSERT INTO posts (user_id, content, image_url, is_premium, coin_price) VALUES (?, ?, ?, ?, ?) RETURNING *',
+      args: [user_id, content, image_url || '', is_premium || 0, coin_price || 0],
     });
     res.json(result.rows[0]);
   } catch (err) {
@@ -348,6 +382,112 @@ app.delete('/api/follows', async (req, res) => {
     const { follower_id, following_id } = req.body;
     await db.execute({ sql: 'DELETE FROM follows WHERE follower_id = ? AND following_id = ?', args: [follower_id, following_id] });
     res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- SUBSCRIPTIONS ---
+app.post('/api/subscribe', async (req, res) => {
+  try {
+    const { user_id, creator_id } = req.body;
+    const cost = 500;
+    const userCheck = await db.execute({ sql: 'SELECT tokens FROM users WHERE id = ?', args: [user_id] });
+    if (userCheck.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    if (userCheck.rows[0].tokens < cost) return res.status(400).json({ error: 'Not enough Cherry Coins' });
+
+    const existing = await db.execute({
+      sql: "SELECT id, expires_at FROM subscriptions WHERE user_id = ? AND creator_id = ? AND expires_at > datetime('now')",
+      args: [user_id, creator_id],
+    });
+
+    const expiresAt = existing.rows.length > 0
+      ? `datetime('${existing.rows[0].expires_at}', '+7 days')`
+      : "datetime('now', '+7 days')";
+
+    if (existing.rows.length > 0) {
+      await db.execute({ sql: `UPDATE subscriptions SET expires_at = ${expiresAt} WHERE id = ?`, args: [existing.rows[0].id] });
+    } else {
+      await db.execute({ sql: `INSERT INTO subscriptions (user_id, creator_id, expires_at) VALUES (?, ?, ${expiresAt})`, args: [user_id, creator_id] });
+    }
+
+    await db.execute({ sql: 'UPDATE users SET tokens = tokens - ? WHERE id = ?', args: [cost, user_id] });
+    await db.execute({ sql: 'UPDATE users SET tokens = tokens + ? WHERE id = ?', args: [cost, creator_id] });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/subscriptions/:userId', async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql: `SELECT s.*, u.display_name, u.username, u.avatar_url, u.role
+            FROM subscriptions s JOIN users u ON s.creator_id = u.id
+            WHERE s.user_id = ? AND s.expires_at > datetime('now')
+            ORDER BY s.expires_at ASC`,
+      args: [req.params.userId],
+    });
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/subscriptions/check/:userId/:creatorId', async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql: "SELECT id, expires_at FROM subscriptions WHERE user_id = ? AND creator_id = ? AND expires_at > datetime('now')",
+      args: [req.params.userId, req.params.creatorId],
+    });
+    res.json({ subscribed: result.rows.length > 0, expires_at: result.rows[0]?.expires_at || null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- POST UNLOCKS ---
+app.post('/api/posts/:id/unlock', async (req, res) => {
+  try {
+    const { user_id } = req.body;
+    const post = await db.execute({ sql: 'SELECT * FROM posts WHERE id = ?', args: [req.params.id] });
+    if (post.rows.length === 0) return res.status(404).json({ error: 'Post not found' });
+    const p = post.rows[0];
+    if (p.is_premium !== 2) return res.status(400).json({ error: 'Post is not coin-locked' });
+
+    const already = await db.execute({ sql: 'SELECT 1 FROM post_unlocks WHERE user_id = ? AND post_id = ?', args: [user_id, req.params.id] });
+    if (already.rows.length > 0) return res.json({ ok: true });
+
+    const userCheck = await db.execute({ sql: 'SELECT tokens FROM users WHERE id = ?', args: [user_id] });
+    if (userCheck.rows[0].tokens < p.coin_price) return res.status(400).json({ error: 'Not enough Cherry Coins' });
+
+    await db.execute({ sql: 'INSERT INTO post_unlocks (user_id, post_id) VALUES (?, ?)', args: [user_id, req.params.id] });
+    await db.execute({ sql: 'UPDATE users SET tokens = tokens - ? WHERE id = ?', args: [p.coin_price, user_id] });
+    await db.execute({ sql: 'UPDATE users SET tokens = tokens + ? WHERE id = ?', args: [p.coin_price, p.user_id] });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/posts/:id/access/:userId', async (req, res) => {
+  try {
+    const post = await db.execute({ sql: 'SELECT * FROM posts WHERE id = ?', args: [req.params.id] });
+    if (post.rows.length === 0) return res.status(404).json({ error: 'Post not found' });
+    const p = post.rows[0];
+    if (p.is_premium === 0 || p.user_id === parseInt(req.params.userId)) return res.json({ access: true });
+    if (p.is_premium === 1) {
+      const sub = await db.execute({
+        sql: "SELECT 1 FROM subscriptions WHERE user_id = ? AND creator_id = ? AND expires_at > datetime('now')",
+        args: [req.params.userId, p.user_id],
+      });
+      return res.json({ access: sub.rows.length > 0, reason: 'subscribers' });
+    }
+    if (p.is_premium === 2) {
+      const unlock = await db.execute({ sql: 'SELECT 1 FROM post_unlocks WHERE user_id = ? AND post_id = ?', args: [req.params.userId, req.params.id] });
+      return res.json({ access: unlock.rows.length > 0, reason: 'coins', price: p.coin_price });
+    }
+    res.json({ access: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
