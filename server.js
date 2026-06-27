@@ -64,7 +64,7 @@ app.get('/api/users', async (req, res) => {
 app.get('/api/profile/:username', async (req, res) => {
   try {
     const result = await db.execute({
-      sql: 'SELECT id, username, display_name, role, avatar_url, banner_url, bio, tokens FROM users WHERE username = ?',
+      sql: 'SELECT id, username, display_name, role, avatar_url, banner_url, bio, tokens, fake_followers, fake_subscribers FROM users WHERE username = ?',
       args: [req.params.username],
     });
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
@@ -72,11 +72,13 @@ app.get('/api/profile/:username', async (req, res) => {
     const followers = await db.execute({ sql: 'SELECT COUNT(*) as count FROM follows WHERE following_id = ?', args: [user.id] });
     const following = await db.execute({ sql: 'SELECT COUNT(*) as count FROM follows WHERE follower_id = ?', args: [user.id] });
     const postCount = await db.execute({ sql: 'SELECT COUNT(*) as count FROM posts WHERE user_id = ?', args: [user.id] });
+    const subscribers = await db.execute({ sql: "SELECT COUNT(*) as count FROM subscriptions WHERE creator_id = ? AND expires_at > datetime('now')", args: [user.id] });
     res.json({
       ...user,
-      followers: followers.rows[0].count,
+      followers: followers.rows[0].count + (user.fake_followers || 0),
       following: following.rows[0].count,
       post_count: postCount.rows[0].count,
+      subscribers: subscribers.rows[0].count + (user.fake_subscribers || 0),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -155,12 +157,88 @@ app.put('/api/users/:id/password', async (req, res) => {
   }
 });
 
+// --- FOLDERS ---
+app.get('/api/folders/:userId', async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql: `SELECT f.*, (SELECT COUNT(*) FROM gallery WHERE folder_id = f.id) as photo_count,
+            (SELECT image_url FROM gallery WHERE folder_id = f.id ORDER BY created_at DESC LIMIT 1) as cover_url
+            FROM folders f WHERE f.user_id = ? ORDER BY f.name ASC`,
+      args: [req.params.userId],
+    });
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/folders', async (req, res) => {
+  try {
+    const { user_id, name } = req.body;
+    const result = await db.execute({
+      sql: 'INSERT INTO folders (user_id, name) VALUES (?, ?) RETURNING *',
+      args: [user_id, name],
+    });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/folders/:id', async (req, res) => {
+  try {
+    const { name } = req.body;
+    await db.execute({ sql: 'UPDATE folders SET name = ? WHERE id = ?', args: [name, req.params.id] });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/folders/:id', async (req, res) => {
+  try {
+    await db.execute({ sql: 'UPDATE gallery SET folder_id = NULL WHERE folder_id = ?', args: [req.params.id] });
+    await db.execute({ sql: 'DELETE FROM folders WHERE id = ?', args: [req.params.id] });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/gallery/move', async (req, res) => {
+  try {
+    const { photo_ids, folder_id } = req.body;
+    for (const id of photo_ids) {
+      await db.execute({ sql: 'UPDATE gallery SET folder_id = ? WHERE id = ?', args: [folder_id, id] });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // --- GALLERY ---
 app.get('/api/gallery/:userId', async (req, res) => {
   try {
+    const folderId = req.query.folder;
+    let result;
+    if (folderId) {
+      result = await db.execute({ sql: 'SELECT * FROM gallery WHERE user_id = ? AND folder_id = ? ORDER BY created_at DESC', args: [req.params.userId, folderId] });
+    } else {
+      result = await db.execute({ sql: 'SELECT * FROM gallery WHERE user_id = ? AND folder_id IS NULL ORDER BY created_at DESC', args: [req.params.userId] });
+    }
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/gallery/:userId/recent', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20;
     const result = await db.execute({
-      sql: 'SELECT * FROM gallery WHERE user_id = ? ORDER BY created_at DESC',
-      args: [req.params.userId],
+      sql: 'SELECT * FROM gallery WHERE user_id = ? ORDER BY created_at DESC LIMIT ?',
+      args: [req.params.userId, limit],
     });
     res.json(result.rows);
   } catch (err) {
@@ -316,13 +394,16 @@ app.get('/api/messages/conversations/:userId', async (req, res) => {
     const result = await db.execute({
       sql: `SELECT u.id, u.display_name, u.username, u.avatar_url, u.role,
               (SELECT content FROM messages WHERE (sender_id = u.id AND receiver_id = ?) OR (sender_id = ? AND receiver_id = u.id) ORDER BY created_at DESC LIMIT 1) as last_message,
-              (SELECT COUNT(*) FROM messages WHERE sender_id = u.id AND receiver_id = ? AND is_read = 0) as unread
+              (SELECT sender_id FROM messages WHERE (sender_id = u.id AND receiver_id = ?) OR (sender_id = ? AND receiver_id = u.id) ORDER BY created_at DESC LIMIT 1) as last_sender_id,
+              (SELECT COUNT(*) FROM messages WHERE sender_id = u.id AND receiver_id = ? AND is_read = 0) as unread,
+              (SELECT COUNT(*) FROM follows WHERE follower_id = u.id AND following_id = ?) as is_follower,
+              (SELECT COUNT(*) FROM subscriptions WHERE user_id = u.id AND creator_id = ? AND expires_at > datetime('now')) as is_subscriber
             FROM users u
             WHERE u.id != ? AND (
               u.id IN (SELECT sender_id FROM messages WHERE receiver_id = ?)
               OR u.id IN (SELECT receiver_id FROM messages WHERE sender_id = ?)
             )`,
-      args: [uid, uid, uid, uid, uid, uid],
+      args: [uid, uid, uid, uid, uid, uid, uid, uid, uid, uid],
     });
     res.json(result.rows);
   } catch (err) {
