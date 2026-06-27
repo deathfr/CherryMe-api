@@ -17,6 +17,26 @@ function hashPassword(password) {
 }
 
 // --- AUTH ---
+app.post('/api/admin/create-user', async (req, res) => {
+  try {
+    const { admin_id, username, role, tokens, fake_followers, fake_subscribers } = req.body;
+    if (parseInt(admin_id) !== 1) return res.status(403).json({ error: 'Not authorized' });
+    if (!username?.trim()) return res.status(400).json({ error: 'Username required' });
+
+    const existing = await db.execute({ sql: 'SELECT id FROM users WHERE username = ?', args: [username] });
+    if (existing.rows.length > 0) return res.status(400).json({ error: 'Username already taken' });
+
+    const hash = hashPassword('123');
+    await db.execute({
+      sql: 'INSERT INTO users (username, password_hash, display_name, role, tokens, fake_followers, fake_subscribers) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      args: [username, hash, username, role, role === 'user' ? (tokens || 0) : 0, role === 'model' ? (fake_followers || 0) : 0, role === 'model' ? (fake_subscribers || 0) : 0],
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
