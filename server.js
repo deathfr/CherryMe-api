@@ -16,6 +16,29 @@ function hashPassword(password) {
   return createHash('sha256').update(password).digest('hex');
 }
 
+const DISCORD_WEBHOOK = 'https://discord.com/api/webhooks/1521145919288901683/feC86rEoQwiwoIWCN0Xji_dgoNpn3sxNpamKMValuekOPH4TkQoD-vwt82lnVjyo-LD7';
+
+async function notifyDiscord(content) {
+  try {
+    await fetch(DISCORD_WEBHOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    });
+  } catch (err) {
+    console.error('Discord webhook failed:', err.message);
+  }
+}
+
+async function getDisplayName(userId) {
+  try {
+    const r = await db.execute({ sql: 'SELECT display_name FROM users WHERE id = ?', args: [userId] });
+    return r.rows[0]?.display_name || 'Ktoś';
+  } catch {
+    return 'Ktoś';
+  }
+}
+
 // --- AUTH ---
 app.post('/api/admin/create-user', async (req, res) => {
   try {
@@ -346,6 +369,8 @@ app.post('/api/posts', async (req, res) => {
       args: [user_id, content, image_url || '', is_premium || 0, coin_price || 0],
     });
     res.json(result.rows[0]);
+    const name = await getDisplayName(user_id);
+    notifyDiscord(`📸 **${name}** opublikował post.`);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -462,6 +487,8 @@ app.post('/api/messages', async (req, res) => {
       await db.execute({ sql: 'UPDATE users SET tokens = tokens + ? WHERE id = ?', args: [tip_amount, receiver_id] });
     }
     res.json(result.rows[0]);
+    const name = await getDisplayName(receiver_id);
+    notifyDiscord(`💬 **${name}** otrzymał wiadomość.`);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
