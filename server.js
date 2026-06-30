@@ -377,6 +377,18 @@ app.post('/api/posts', async (req, res) => {
 });
 
 // --- LIKES ---
+app.get('/api/likes/check/:userId/:postId', async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql: 'SELECT 1 FROM likes WHERE user_id = ? AND post_id = ?',
+      args: [req.params.userId, req.params.postId],
+    });
+    res.json({ liked: result.rows.length > 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/likes', async (req, res) => {
   try {
     const { user_id, post_id } = req.body;
